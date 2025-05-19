@@ -1,0 +1,1054 @@
+<?php
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type");
+ 
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_NAME', 'home_automation');
+date_default_timezone_set('Asia/Manila');
+ 
+// Handle OPTIONS requests first
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit();
+}
+ 
+// Database connection
+function getDBConnection() {
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+    if ($conn->connect_error) {
+        die("Connection failed: " . $conn->connect_error);
+    }
+    return $conn;
+}
+ 
+// Handle API requests
+if (isset($_GET['api'])) {
+    $apiEndpoint = $_GET['api'];
+   
+    // Check if this is a database operation
+    if (strpos($apiEndpoint, 'db/') === 0) {
+        handleDatabaseOperation($apiEndpoint);
+        exit();
+    }
+   
+    // Otherwise, forward to NodeMCU
+    $nodeMCU_IP = "192.168.100.70";
+    $url = "http://{$nodeMCU_IP}/api/{$apiEndpoint}";
+   
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+   
+    $method = $_SERVER['REQUEST_METHOD'];
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+    } elseif ($method === 'PUT' || $method === 'DELETE') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+    }
+   
+    if ($method === 'POST' || $method === 'PUT') {
+        $postData = file_get_contents('php://input');
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    }
+   
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+   
+    if (curl_errno($ch)) {
+        http_response_code(500);
+        echo json_encode(["error" => "Failed to connect to NodeMCU: " . curl_error($ch)]);
+    } else {
+        http_response_code($httpCode);
+        header('Content-Type: application/json');
+        echo $response;
+    }
+   
+    curl_close($ch);
+    exit();
+}
+ 
+function handleDatabaseOperation($endpoint) {
+    $conn = getDBConnection();
+   
+    try {
+        switch ($endpoint) {
+            case 'db/status':
+                handleStatusRequest($conn);
+                break;
+               
+            case 'db/relays':
+                handleRelaysRequest($conn);
+                break;
+               
+            case 'db/schedules':
+                handleSchedulesRequest($conn);
+                break;
+            case 'schedules':  // Add this line to handle both endpoints
+                handleSchedulesRequest($conn);
+                break;
+               
+            case 'db/smoke':
+                handleSmokeRequest($conn);
+                break;
+               
+            case 'db/alerts':
+                handleAlertsRequest($conn);
+                break;
+           
+            case 'db/temperature':
+                handleTemperatureRequest($conn);
+                break;
+ 
+            default:
+                http_response_code(404);
+                echo json_encode(["error" => "Database endpoint not found"]);
+        }
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(["error" => $e->getMessage()]);
+    } finally {
+        $conn->close();
+    }
+}
+ 
+function handleTemperatureRequest($conn) {
+    $method = $_SERVER['REQUEST_METHOD'];
+   
+    if ($method === 'POST') {
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (!isset($input['temperature']) || !isset($input['humidity'])) {
+            throw new Exception("Temperature or humidity not specified");
+        }
+       
+        $temperature = (float)$input['temperature'];
+        $humidity = (float)$input['humidity'];
+       
+        $stmt = $conn->prepare("UPDATE temperature_logs SET temperature = ?, humidity = ?, updated_at = NOW() WHERE id = 1");
+        $stmt->bind_param("dd", $temperature, $humidity);
+        $stmt->execute();
+       
+        echo json_encode(["status" => "OK"]);
+    } else {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+    }
+}
+function handleStatusRequest($conn) {
+    $response = [];
+   
+    // Get relay states
+    $result = $conn->query("SELECT relay_number, state FROM relays ORDER BY relay_number");
+    while ($row = $result->fetch_assoc()) {
+        $response['relay' . $row['relay_number']] = (bool)$row['state'];
+    }
+   
+    // Get schedules - MODIFIED TO ENSURE ALL ACTIVE SCHEDULES ARE RETURNED
+    $result = $conn->query("
+        SELECT r.relay_number,
+               IFNULL(DATE_FORMAT(s.on_time, '%h:%i %p'), 'Not set') as on_time,
+               IFNULL(DATE_FORMAT(s.off_time, '%h:%i %p'), 'Not set') as off_time
+        FROM (SELECT 1 as relay_number UNION SELECT 2) r
+        LEFT JOIN schedules s ON r.relay_number = s.relay_number AND s.active = 1
+        ORDER BY r.relay_number
+    ");
+   
+    while ($row = $result->fetch_assoc()) {
+        $relay = $row['relay_number'];
+        if ($row['on_time'] != 'Not set' && $row['off_time'] != 'Not set') {
+            $response['relay' . $relay . '_schedule'] = $row['on_time'] . ' to ' . $row['off_time'];
+        } else {
+            $response['relay' . $relay . '_schedule'] = 'Not set';
+        }
+    }
+   
+    $result = $conn->query("SELECT temperature, humidity FROM temperature_logs WHERE id = 1");
+    if ($row = $result->fetch_assoc()) {
+        $response['temperature'] = (float)$row['temperature'];
+        $response['humidity'] = (float)$row['humidity'];
+    } else {
+        $response['temperature'] = 0;
+        $response['humidity'] = 0;
+    }
+    // Get latest smoke reading
+    $result = $conn->query("SELECT sensor_value FROM smoke_logs WHERE id = 1");
+    if ($row = $result->fetch_assoc()) {
+        $response['smoke_value'] = (int)$row['sensor_value'];
+    } else {
+        $response['smoke_value'] = 0;
+    }
+   
+   
+    // Check for active smoke alert
+    $result = $conn->query("SELECT 1 FROM alerts WHERE alert_type = 'smoke' AND active = 1 LIMIT 1");
+    $response['smoke_detected'] = $result->num_rows > 0;
+    $response['alert_active'] = $response['smoke_detected'];
+   
+    // Current time
+    $response['time'] = date('h:i:s A');
+   
+    header('Content-Type: application/json');
+    echo json_encode($response);
+}
+ 
+function handleRelaysRequest($conn) {
+    $method = $_SERVER['REQUEST_METHOD'];
+    $input = json_decode(file_get_contents('php://input'), true);
+   
+    if ($method === 'PUT') {
+        if (!isset($input['relay'])) {
+            throw new Exception("Relay number not specified");
+        }
+       
+        $relay = (int)$input['relay'];
+        $state = isset($input['state']) ? (int)$input['state'] : null;
+       
+        if ($state === null) {
+            // Toggle state if not specified
+            $stmt = $conn->prepare("SELECT state FROM relays WHERE relay_number = ?");
+            $stmt->bind_param("i", $relay);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            $current = $result->fetch_assoc();
+            $state = $current['state'] ? 0 : 1;
+        }
+       
+        $stmt = $conn->prepare("UPDATE relays SET state = ? WHERE relay_number = ?");
+        $stmt->bind_param("ii", $state, $relay);
+        $stmt->execute();
+       
+        echo json_encode([
+            "status" => "OK",
+            "relay" => $relay,
+            "state" => $state
+        ]);
+    } else {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+    }
+}
+ 
+function handleSchedulesRequest($conn) {
+  $method = $_SERVER['REQUEST_METHOD'];
+  $input = json_decode(file_get_contents('php://input'), true);
+ 
+  if ($method === 'POST') {
+      // Validate input
+      $required = ['on_hour', 'on_minute', 'on_ampm', 'off_hour', 'off_minute', 'off_ampm', 'relay'];
+      foreach ($required as $field) {
+          if (!isset($input[$field])) {
+              throw new Exception("Missing required field: $field");
+          }
+      }
+     
+      // Convert to 24-hour format
+      $onTime = convertTo24Hour($input['on_hour'], $input['on_minute'], $input['on_ampm']);
+      $offTime = convertTo24Hour($input['off_hour'], $input['off_minute'], $input['off_ampm']);
+     
+      // Handle relay selection
+      $relays = [];
+      if ($input['relay'] === 'both') {
+          $relays = [1, 2];
+      } else {
+          $relays = [(int)$input['relay']];
+      }
+     
+      // Update schedules
+      foreach ($relays as $relay) {
+          // First deactivate any existing schedule for this relay
+          $stmt = $conn->prepare("UPDATE schedules SET active = 0 WHERE relay_number = ?");
+          $stmt->bind_param("i", $relay);
+          $stmt->execute();
+         
+          // Insert new schedule
+          $stmt = $conn->prepare("INSERT INTO schedules (relay_number, on_time, off_time) VALUES (?, ?, ?)");
+          $stmt->bind_param("iss", $relay, $onTime, $offTime);
+          $stmt->execute();
+      }
+     
+      // Now get ALL active schedules to return to client
+      $response = ["status" => "Schedule Set"];
+      $result = $conn->query("
+          SELECT relay_number,
+                 DATE_FORMAT(on_time, '%h:%i %p') as on_time,
+                 DATE_FORMAT(off_time, '%h:%i %p') as off_time
+          FROM schedules
+          WHERE active = 1
+          ORDER BY relay_number
+      ");
+     
+      while ($row = $result->fetch_assoc()) {
+          $relay = $row['relay_number'];
+          $response["relay" . $relay . "_schedule"] = $row['on_time'] . ' to ' . $row['off_time'];
+      }
+     
+      echo json_encode($response);
+  } else {
+      http_response_code(405);
+      echo json_encode(["error" => "Method not allowed"]);
+  }
+}
+ 
+function handleSmokeRequest($conn) {
+    $method = $_SERVER['REQUEST_METHOD'];
+   
+    if ($method === 'POST') {
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (!isset($input['value'])) {
+            throw new Exception("Smoke value not specified");
+        }
+       
+        $value = (int)$input['value'];
+        $threshold = isset($input['threshold']) ? (int)$input['threshold'] : 250;
+        $alertTriggered = $value > $threshold ? 1 : 0;
+       
+        // Log smoke reading
+        $stmt = $conn->prepare("UPDATE smoke_logs SET sensor_value = ?, alert_triggered = ?, updated_at = NOW() WHERE id = 1");
+        $stmt->bind_param("ii", $value, $alertTriggered);
+        $stmt->execute();
+       
+        // Handle alert if threshold exceeded
+        if ($alertTriggered) {
+            // Check if alert already exists
+            $result = $conn->query("SELECT id FROM alerts WHERE alert_type = 'smoke' AND active = 1 LIMIT 1");
+            if ($result->num_rows === 0) {
+                $conn->query("INSERT INTO alerts (alert_type, active) VALUES ('smoke', 1)");
+            }
+        }
+       
+        echo json_encode(["status" => "OK"]);
+    } else {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+    }
+}
+ 
+function handleAlertsRequest($conn) {
+  $method = $_SERVER['REQUEST_METHOD'];
+ 
+  if ($method === 'DELETE') {
+      // Reset all active smoke alerts
+      $result = $conn->query("UPDATE alerts SET active = 0, resolved_at = NOW() WHERE alert_type = 'smoke' AND active = 1");
+     
+      if ($result) {
+          // Check if any rows were affected
+          if ($conn->affected_rows > 0) {
+              echo json_encode([
+                  "status" => "success",
+                  "message" => "Alert Reset",
+                  "alert_active" => false
+              ]);
+          } else {
+              echo json_encode([
+                  "status" => "success",
+                  "message" => "No active alerts to reset",
+                  "alert_active" => false
+              ]);
+          }
+      } else {
+          http_response_code(500);
+          echo json_encode([
+              "status" => "error",
+              "message" => "Database error: " . $conn->error
+          ]);
+      }
+  } else {
+      http_response_code(405);
+      echo json_encode(["error" => "Method not allowed"]);
+  }
+}
+ 
+function convertTo24Hour($hour, $minute, $ampm) {
+    $hour = (int)$hour;
+    $minute = (int)$minute;
+   
+    if ($ampm === 'PM' && $hour < 12) $hour += 12;
+    if ($ampm === 'AM' && $hour == 12) $hour = 0;
+   
+    return sprintf('%02d:%02d:00', $hour, $minute);
+}
+?>
+ 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home Automation</title>
+    <style>
+        body { font-family: Arial; text-align: center; margin: 20px; }
+        .alert { background: #ff4444; color: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        button { padding: 10px 15px; margin: 5px; font-size: 16px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .relay-btn {
+            width: 100px;
+            height: 100px;
+            border-radius: 50%;
+            font-size: 20px;
+            margin: 15px;
+        }
+        .relay-on { background-color: #4CAF50; color: white; }
+        .relay-off { background-color: #f44336; color: white; }
+        .schedule-form {
+            background: #f0f8ff;
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+        }
+        .status-box {
+            background: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            text-align: left;
+        }
+        /* New Gauge Styles */
+        .sensor-row {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 15px 0;
+    gap: 10px;
+}
+ 
+.gauge-container {
+    width: 180px;  /* Reduced from 200px for better fit */
+    height: 180px; /* Reduced from 200px for better fit */
+    margin: 0;     /* Remove the auto margin */
+    position: relative;
+    flex: 1;
+    min-width: 150px;
+    max-width: 180px;
+}
+ 
+        .gauge-body {
+            width: 90%;
+            height: 90%;
+            border-radius: 50%;
+            background: #f5f5f5;
+            position: relative;
+            overflow: hidden;
+            border: 10px solid #f0f0f0;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.1);
+        }
+        .status-info {
+    margin-top: 15px;
+    text-align: center;
+}
+ 
+/* Responsive adjustments */
+@media (max-width: 600px) {
+    .sensor-row {
+        flex-direction: column;
+    }
+   
+    .gauge-container {
+        width: 150px;
+        height: 150px;
+        margin-bottom: 15px;
+    }
+}
+        .gauge-fill {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: conic-gradient(
+                #4CAF50 0% 30%,
+                #FFC107 30% 60%,
+                #F44336 60% 100%
+            );
+            border-radius: 50%;
+            transform: rotate(-0.25turn);
+            transform-origin: center;
+            clip-path: polygon(0 0, 50% 0, 50% 100%, 0 100%);
+        }
+ 
+        .gauge-cover {
+            width: 75%;
+            height: 75%;
+            background: white;
+            border-radius: 50%;
+            position: absolute;
+            top: 12.5%;
+            left: 12.5%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            font-weight: bold;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+ 
+        .gauge-value {
+            font-size: 24px;
+            font-weight: bold;
+        }
+ 
+        .gauge-label {
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+ 
+        .safe {
+            color: #4CAF50;
+        }
+ 
+        .warning {
+            color: #FFC107;
+        }
+ 
+        .danger {
+            color: #F44336;
+        }
+ 
+        .gauge-marks {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+        }
+ 
+        .gauge-mark {
+            position: absolute;
+            width: 3px;
+            height: 10px;
+            background: #999;
+            left: 50%;
+            transform-origin: bottom center;
+        }
+ 
+        .gauge-numbers {
+            position: absolute;
+            width: 90%;
+            height: 90%;
+            top: 5%;
+            left: 5%;
+        }
+ 
+        .gauge-number {
+            position: absolute;
+            font-size: 12px;
+            color: #666;
+            transform: translate(-50%, -50%);
+        }
+        /* Temperature gauge specific colors */
+#tempGaugeFill {
+    background: conic-gradient(
+        #4CAF50 0% 40%,    /* Cool (0-20°C) */
+        #FFC107 40% 60%,   /* Warm (20-30°C) */
+        #F44336 60% 100%   /* Hot (30-50°C) */
+    );
+}
+ 
+/* Humidity gauge specific colors */
+#humidityGaugeFill {
+    background: conic-gradient(
+        #F44336 0% 30%,    /* Dry (0-30%) */
+        #4CAF50 30% 70%,   /* Comfortable (30-70%) */
+        #FFC107 70% 100%   /* Humid (70-100%) */
+    );
+}
+ 
+ 
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Home Automation System</h2>
+       
+        <div id="smokeAlert" class="alert" style="display:none;">
+            <strong>SMOKE DETECTED!</strong>
+            <button onclick="resetAlert()">Reset Alert</button>
+        </div>
+       
+        <div class="relay-controls">
+            <button id="relay1Btn" class="relay-btn relay-off" onclick="toggleRelay(1)">OFF</button>
+            <button id="relay2Btn" class="relay-btn relay-off" onclick="toggleRelay(2)">OFF</button>
+        </div>
+       
+        <div class="status-box">
+    <h3>Current Status</h3>
+    <div class="sensor-row">
+        <!-- Smoke Gauge -->
+        <div class="gauge-container">
+            <div class="gauge-body">
+                <div class="gauge-fill" id="smokeGaugeFill"></div>
+                <div class="gauge-marks" id="gaugeMarks"></div>
+                <div class="gauge-numbers" id="gaugeNumbers"></div>
+                <div class="gauge-cover">
+                    <div id="smokeValue" class="gauge-value safe">0</div>
+                    <div class="gauge-label">Smoke Level</div>
+                </div>
+            </div>
+        </div>
+       
+        <!-- Temperature Gauge -->
+        <div class="gauge-container">
+            <div class="gauge-body">
+                <div class="gauge-fill" id="tempGaugeFill"></div>
+                <div class="gauge-marks" id="tempGaugeMarks"></div>
+                <div class="gauge-numbers" id="tempGaugeNumbers"></div>
+                <div class="gauge-cover">
+                    <div id="tempValue" class="gauge-value">0</div>
+                    <div class="gauge-label">Temperature °C</div>
+                </div>
+            </div>
+        </div>
+       
+        <!-- Humidity Gauge -->
+        <div class="gauge-container">
+            <div class="gauge-body">
+                <div class="gauge-fill" id="humidityGaugeFill"></div>
+                <div class="gauge-marks" id="humidityGaugeMarks"></div>
+                <div class="gauge-numbers" id="humidityGaugeNumbers"></div>
+                <div class="gauge-cover">
+                    <div id="humidityValue" class="gauge-value">0</div>
+                    <div class="gauge-label">Humidity %</div>
+                </div>
+            </div>
+        </div>
+    </div>
+            <p>Relay 1 Schedule: <span id="relay1Sch">Not set</span></p>
+            <p>Relay 2 Schedule: <span id="relay2Sch">Not set</span></p>
+            <p>Current Time: <span id="currentTime">--:--:-- --</span></p>
+        </div>
+       
+        <div class="schedule-form">
+        <h3>Set Schedule</h3>
+    <div style="display: flex; justify-content: center; gap: 20px; margin-bottom: 15px;">
+        <div>
+            <h4>ON Time</h4>
+            <input type="number" id="on_hour" min="1" max="12" placeholder="HH" style="width: 50px;" onchange="validateHourInput(this)">
+            <input type="number" id="on_minute" min="0" max="59" placeholder="MM" style="width: 50px;" onchange="validateMinuteInput(this)">
+            <select id="on_ampm">
+                <option value="AM">AM</option>
+                <option value="PM">PM</option>
+            </select>
+        </div>
+        <div>
+            <h4>OFF Time</h4>
+            <input type="number" id="off_hour" min="1" max="12" placeholder="HH" style="width: 50px;" onchange="validateHourInput(this)">
+            <input type="number" id="off_minute" min="0" max="59" placeholder="MM" style="width: 50px;" onchange="validateMinuteInput(this)">
+            <select id="off_ampm">
+                <option value="AM">AM</option>
+                <option value="PM">PM</option>
+            </select>
+        </div>
+    </div>
+            <div style="margin-bottom: 15px;">
+                <label>Relay: </label>
+                <select id="relaySelect">
+                    <option value="1">Relay 1</option>
+                    <option value="2">Relay 2</option>
+                    <option value="both">Both Relays</option>
+                </select>
+            </div>
+            <button type="button" onclick="setSchedule()" style="padding: 10px 20px;">SET SCHEDULE</button>
+        </div>
+    </div>
+ 
+    <script>
+        const API_BASE = "<?php echo 'http://' . $_SERVER['HTTP_HOST'] . $_SERVER['PHP_SELF']; ?>?api=";
+        const SMOKE_THRESHOLD = 250;
+        const MAX_SMOKE_VALUE = 1000; // Maximum expected smoke sensor value
+        const MAX_TEMP = 50; // Maximum expected temperature in °C
+        const MAX_HUMIDITY = 100;
+ 
+        document.addEventListener('DOMContentLoaded', function () {
+            // Create gauge marks and numbers
+            createGaugeMarks();
+           
+            loadInitialState();
+ 
+            setInterval(updateStatus, 1000);
+ 
+            // Try to discover NodeMCU IP
+            discoverNodeMCU();
+            createTempGaugeMarks();
+            createHumidityGaugeMarks();
+        });
+ 
+        async function loadInitialState() {
+    try {
+        // Show loading state
+        document.getElementById('relay1Sch').textContent = 'Loading...';
+        document.getElementById('relay2Sch').textContent = 'Loading...';
+       
+        // Fetch initial state
+        const response = await fetch(`${API_BASE}db/status`);
+        if (!response.ok) {
+            throw new Error('Failed to load initial state');
+        }
+        const data = await response.json();
+        updateUI(data);
+ 
+        if (data.alert_active) {
+            document.getElementById('smokeAlert').style.display = 'block';
+        }
+    } catch (error) {
+        console.error('Error loading initial state:', error);
+        // Fall back to default "Not set" if loading fails
+        document.getElementById('relay1Sch').textContent = 'Not set';
+        document.getElementById('relay2Sch').textContent = 'Not set';
+    }
+}
+ 
+function createTempGaugeMarks() {
+    const marksContainer = document.getElementById('tempGaugeMarks');
+    const numbersContainer = document.getElementById('tempGaugeNumbers');
+   
+    // Create marks every 10 degrees (5 marks total)
+    for (let i = 0; i <= 50; i += 10) {
+        const angle = (i / 50) * 180;
+       
+        // Create mark
+        const mark = document.createElement('div');
+        mark.className = 'gauge-mark';
+        mark.style.transform = `rotate(${angle - 90}deg) translateY(-90px)`;
+        marksContainer.appendChild(mark);
+       
+        // Create number
+        const number = document.createElement('div');
+        number.className = 'gauge-number';
+        number.textContent = i;
+       
+        // Position the number
+        const angleRad = (angle - 90) * Math.PI / 180;
+        const radius = 85;
+        const x = 50 + radius * Math.cos(angleRad);
+        const y = 50 + radius * Math.sin(angleRad);
+        number.style.left = `${x}%`;
+        number.style.top = `${y}%`;
+       
+        numbersContainer.appendChild(number);
+    }
+}
+ 
+function createHumidityGaugeMarks() {
+    const marksContainer = document.getElementById('humidityGaugeMarks');
+    const numbersContainer = document.getElementById('humidityGaugeNumbers');
+   
+    // Create marks every 20% (5 marks total)
+    for (let i = 0; i <= 100; i += 20) {
+        const angle = (i / 100) * 180;
+       
+        // Create mark
+        const mark = document.createElement('div');
+        mark.className = 'gauge-mark';
+        mark.style.transform = `rotate(${angle - 90}deg) translateY(-90px)`;
+        marksContainer.appendChild(mark);
+       
+        // Create number
+        const number = document.createElement('div');
+        number.className = 'gauge-number';
+        number.textContent = i;
+       
+        // Position the number
+        const angleRad = (angle - 90) * Math.PI / 180;
+        const radius = 85;
+        const x = 50 + radius * Math.cos(angleRad);
+        const y = 50 + radius * Math.sin(angleRad);
+        number.style.left = `${x}%`;
+        number.style.top = `${y}%`;
+       
+        numbersContainer.appendChild(number);
+    }
+}
+        function createGaugeMarks() {
+            const marksContainer = document.getElementById('gaugeMarks');
+            const numbersContainer = document.getElementById('gaugeNumbers');
+           
+            // Create marks every 30 degrees (12 marks total)
+            for (let i = 0; i <= 180; i += 30) {
+                // Create mark
+                const mark = document.createElement('div');
+                mark.className = 'gauge-mark';
+                mark.style.transform = `rotate(${i - 90}deg) translateY(-90px)`;
+                marksContainer.appendChild(mark);
+               
+                // Create number (only for every 60 degrees)
+                if (i % 60 === 0) {
+                    const number = document.createElement('div');
+                    number.className = 'gauge-number';
+                    const value = Math.round((i / 180) * MAX_SMOKE_VALUE);
+                    number.textContent = value;
+                   
+                    // Position the number
+                    const angle = (i - 90) * Math.PI / 180;
+                    const radius = 85;
+                    const x = 50 + radius * Math.cos(angle);
+                    const y = 50 + radius * Math.sin(angle);
+                    number.style.left = `${x}%`;
+                    number.style.top = `${y}%`;
+                   
+                    numbersContainer.appendChild(number);
+                }
+            }
+        }
+        let lastToggleTime = 0;
+        async function toggleRelay(r) {
+  // Save current time before making the request
+  const relay1Sch = document.getElementById('relay1Sch').textContent;
+  const relay2Sch = document.getElementById('relay2Sch').textContent;
+  const currentTime = document.getElementById('currentTime').textContent;
+  const now = Date.now();
+    if (now - lastToggleTime < 500) return; // 500ms debounce
+    lastToggleTime = now;
+ 
+  try {
+    const response = await fetch(`${API_BASE}relays/${r}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' }
+    });
+   
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(error);
+    }
+   
+    const data = await response.json();
+    // If no time in response, use the preserved time
+    if (!data.relay1_schedule) data.relay1_schedule = relay1Sch;
+    if (!data.relay2_schedule) data.relay2_schedule = relay2Sch;
+    if (!data.time) data.time = currentTime;
+    updateUI(data);
+  } catch (error) {
+    console.error('Error:', error);
+    alert(`Failed to toggle relay: ${error.message}`);
+  }
+}
+ 
+function validateHourInput(input) {
+    const value = parseInt(input.value);
+    if (isNaN(value) || value < 1 || value > 12) {
+        input.value = '';
+        alert('Hour must be between 1 and 12');
+        input.focus();
+        return false;
+    }
+    return true;
+}
+ 
+function validateMinuteInput(input) {
+    const value = parseInt(input.value);
+    if (isNaN(value) || value < 0 || value > 59) {
+        input.value = '';
+        alert('Minute must be between 0 and 59');
+        input.focus();
+        return false;
+    }
+    return true;
+}
+ 
+async function setSchedule() {
+    const data = {
+        on_hour: document.getElementById('on_hour').value,
+        on_minute: document.getElementById('on_minute').value,
+        on_ampm: document.getElementById('on_ampm').value,
+        off_hour: document.getElementById('off_hour').value,
+        off_minute: document.getElementById('off_minute').value,
+        off_ampm: document.getElementById('off_ampm').value,
+        relay: document.getElementById('relaySelect').value
+    };
+ 
+    if (!data.on_hour || !data.on_minute || !data.off_hour || !data.off_minute) {
+        alert('Please fill in all time fields');
+        return;
+    }
+   
+   
+    try {
+        // Change this line from 'schedules' to 'db/schedules'
+        const response = await fetch(`${API_BASE}db/schedules`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+       
+        if (!response.ok) {
+            const error = await response.text();
+            throw new Error(error);
+        }
+       
+        const result = await response.json();
+ 
+        if (result.relay1_schedule) {
+            document.getElementById('relay1Sch').textContent = result.relay1_schedule;
+        }
+        if (result.relay2_schedule) {
+            document.getElementById('relay2Sch').textContent = result.relay2_schedule;
+        }
+ 
+        alert('Schedule set successfully');
+        updateStatus();
+    } catch (error) {
+        console.error('Error:', error);
+        alert(`Failed to set schedule: ${error.message}`);
+    }
+}
+       
+async function resetAlert() {
+    try {
+        const response = await fetch(`${API_BASE}db/alerts`, {
+            method: 'DELETE'
+        });
+       
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.message || 'Failed to reset alert');
+        }
+       
+        const result = await response.json();
+       
+        // Manually hide the alert when reset is clicked
+        document.getElementById('smokeAlert').style.display = 'none';
+       
+        // Update the status to reflect the alert is no longer active
+        updateStatus();
+       
+        // Show success message if needed
+        if (result.message) {
+            console.log(result.message);
+        }
+    } catch (error) {
+        console.error('Error:', error);
+        alert(`Failed to reset alert: ${error.message}`);
+    }
+}
+       
+        async function updateStatus() {
+            try {
+                const response = await fetch(`${API_BASE}db/status`);
+                if (!response.ok) {
+                    throw new Error('Failed to get status');
+                }
+                const data = await response.json();
+                updateUI(data);
+            } catch (error) {
+                console.error('Error fetching status:', error);
+            }
+        }
+       
+        function updateUI(data) {
+    // Update relay buttons
+    const relay1Btn = document.getElementById('relay1Btn');
+    const relay2Btn = document.getElementById('relay2Btn');
+   
+    if (data.relay1 !== undefined) {
+        relay1Btn.textContent = data.relay1 ? 'ON' : 'OFF';
+        relay1Btn.className = `relay-btn ${data.relay1 ? 'relay-on' : 'relay-off'}`;
+    }
+   
+    if (data.relay2 !== undefined) {
+        relay2Btn.textContent = data.relay2 ? 'ON' : 'OFF';
+        relay2Btn.className = `relay-btn ${data.relay2 ? 'relay-on' : 'relay-off'}`;
+    }
+   
+    // Update temperature - use last value if not in response
+    if (data.temperature !== undefined) {
+        lastTemperature = data.temperature;
+    }
+    const tempValue = Math.min(lastTemperature, MAX_TEMP);
+    const tempDisplay = document.getElementById('tempValue');
+    const tempGaugeFill = document.getElementById('tempGaugeFill');
+   
+    // Calculate rotation (0-180 degrees)
+    const rotation = (tempValue / MAX_TEMP) * 180;
+    tempGaugeFill.style.transform = `rotate(${rotation - 90}deg)`;
+   
+    // Update numeric display
+    tempDisplay.textContent = tempValue.toFixed(1);
+   
+    // Change color based on value
+    if (tempValue < 20) {
+        tempDisplay.className = 'gauge-value safe'; // Cool
+    } else if (tempValue < 30) {
+        tempDisplay.className = 'gauge-value warning'; // Warm
+    } else {
+        tempDisplay.className = 'gauge-value danger'; // Hot
+    }
+   
+    // Update humidity - use last value if not in response
+    if (data.humidity !== undefined) {
+        lastHumidity = data.humidity;
+    }
+    const humidityValue = Math.min(lastHumidity, MAX_HUMIDITY);
+    const humidityDisplay = document.getElementById('humidityValue');
+    const humidityGaugeFill = document.getElementById('humidityGaugeFill');
+   
+    // Calculate rotation (0-180 degrees)
+    const humidityRotation = (humidityValue / MAX_HUMIDITY) * 180;
+    humidityGaugeFill.style.transform = `rotate(${humidityRotation - 90}deg)`;
+   
+    // Update numeric display
+    humidityDisplay.textContent = humidityValue.toFixed(1);
+   
+    // Change color based on value
+    if (humidityValue < 30) {
+        humidityDisplay.className = 'gauge-value danger'; // Too dry
+    } else if (humidityValue < 70) {
+        humidityDisplay.className = 'gauge-value safe'; // Comfortable
+    } else {
+        humidityDisplay.className = 'gauge-value warning'; // Too humid
+    }
+   
+    // Update schedule display
+    if (data.relay1_schedule !== undefined) {
+        document.getElementById('relay1Sch').textContent =
+            data.relay1_schedule || 'Not set';
+    }
+    if (data.relay2_schedule !== undefined) {
+        document.getElementById('relay2Sch').textContent =
+            data.relay2_schedule || 'Not set';
+    }
+   
+    // Update other status elements
+    if (data.time !== undefined) {
+        document.getElementById('currentTime').textContent = data.time || '--:--:-- --';
+    }
+   
+    // Update smoke level with circular gauge
+    if (data.smoke_value !== undefined) {
+        const smokeValue = Math.min(data.smoke_value, MAX_SMOKE_VALUE);
+        const smokeDisplay = document.getElementById('smokeValue');
+        const gaugeFill = document.getElementById('smokeGaugeFill');
+       
+        // Calculate rotation (0-180 degrees)
+        const rotation = (smokeValue / MAX_SMOKE_VALUE) * 180;
+        gaugeFill.style.transform = `rotate(${rotation - 90}deg)`;
+       
+        // Update numeric display
+        smokeDisplay.textContent = smokeValue;
+       
+        // Change color based on value
+        if (smokeValue < SMOKE_THRESHOLD * 0.5) {
+            smokeDisplay.className = 'gauge-value safe';
+        } else if (smokeValue < SMOKE_THRESHOLD) {
+            smokeDisplay.className = 'gauge-value warning';
+        } else {
+            smokeDisplay.className = 'gauge-value danger';
+        }
+       
+        // Only show alert when smoke is detected (but don't hide it automatically)
+        if (smokeValue >= SMOKE_THRESHOLD) {
+            document.getElementById('smokeAlert').style.display = 'block';
+        }
+    }
+}
+   
+ 
+    </script>
+</body>
+</html>
